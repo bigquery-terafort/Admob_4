@@ -1,24 +1,50 @@
-name: AdMob Full Sync to BigQuery (Account 4 - admob4_968)
+name: AdMob Full Sync to BigQuery
 
 # =============================================================================
-#  repo: bigquery-terafort/Admob_4       publisher: pub-9688592152492531
-#  path: .github/workflows/admob_sync.yml
+#  YE FILE CHAARO ADMOB REPOS MEIN BINA KISI TABDEELI KE LAGTI HAI.
 #
-#  RUN #107 KYUN MARA — TIMEOUT, SCRIPT KA ERROR NAHI
-#    "cancelled in 1h 0m 16s" = GitHub ka timeout-minutes: 60
-#    MAAP: 06-05 -> 06-21 = 17 din, ~57 min = ~3.2 min/din
-#      pub-5036   13.5K rows/din   0.87 min/din    90 din =  78 min  OK
-#      pub-9688   39.0K rows/din   3.20 min/din    90 din = ~290 min FAIL
-#    Ye account ~3x bara hai. Sirf timeout barhana galat ilaaj hai —
-#    chauthe ghante mein ek flaky call aur poora run dobara zaya.
-#    DATA MEHFOOZ RAHA: v6 ka fetch-before-delete chala. 0 missing days,
-#    0 duplicate runs (BigQuery se verify kiya).
+#  DO CHEEZEIN HAR REPO MEIN ALAG HAIN — DONO KA HAL FILE KE ANDAR HAI:
 #
-#  FIX: backfill ab 15-din ke chunks mein. Har chunk ~50 min.
-#       Chunk 4 fail ho to sirf chunk 4 dobara chalao.
+#   1. SCRIPT KA NAAM/JAGAH alag hai:
+#          admob_50  -> src/admob_python.py
+#          Admob_4   -> src/admob_full_sync.py (ya jo bhi)
+#      -> Workflow naam se nahi, file ke ANDAR ke marker
+#         ('admob_unified_fact') se dhoondhti hai.
 #
-#  max-parallel: 1 LAZMI HAI — har chunk shuru mein sync_dims chalata hai
-#  jo publisher-scoped DELETE+INSERT transaction hai. Parallel chunks usi
+#   2. SECRETS KE NAAM alag hain:
+#          admob_50  -> ADMOB_PUBLISHER_ID_ACCOUNT2
+#          baqi      -> plain ya _ACCOUNT1/3/4
+#      -> `||` chain lagayi hai. GitHub expressions mein missing secret
+#         khaali string ('' = falsy) hoti hai, is liye chain pehla
+#         maujood naam uthhaa leti hai. Koi error nahi aata.
+#
+#  Publisher ka farq sirf ADMOB_PUBLISHER_ID* secret se aata hai —
+#  repo ke naam, workflow ke title ya file ke naam se NAHI.
+#
+#  path: .github/workflows/<jo bhi naam ho>.yml
+#
+#  RUN #129 KYUN MARA — GALAT PATH
+#    python: can't open file '.../src/admob_full_sync.py': No such file
+#    Har repo ka layout alag hai. Kuch mein script root pe hai, kuch mein
+#    src/ ke andar. Hard-coded path chaaro repos mein kaam nahi karta.
+#    Aur naam bhi har repo mein alag hai:
+#        admob_50   -> src/admob_python.py
+#        Admob_4    -> src/admob_full_sync.py
+#    → Ab workflow script ko NAAM se nahi, us ke ANDAR ke marker
+#      ('admob_unified_fact') se dhoondhti hai. Naam/folder kuch bhi ho,
+#      chal jayegi.
+#
+#  RUN #110 KYUN MARA — 0 SECONDS, YAML PARSE ERROR
+#    File ke shuru mein markdown note tha. Ab file `name:` se shuru hoti hai
+#    aur YAML ke andar koi embedded python heredoc nahi.
+#
+#  RUN #107 KYUN MARA — 60-MIN TIMEOUT (Admob_4 / pub-9688)
+#    Maap: 17 din ~57 min = ~3.2 min/din. 90 din = ~290 min.
+#    → Backfill ab 15-din ke chunks mein. Har chunk ~50 min.
+#    DATA MEHFOOZ RAHA: v6 ka fetch-before-delete chala.
+#
+#  max-parallel: 1 LAZMI — har chunk shuru mein sync_dims chalata hai jo
+#  publisher-scoped DELETE+INSERT transaction hai. Parallel chunks usi
 #  publisher_id ki rows par takrayenge.
 #
 #  CANCELLED RUNS admob_sync_log MEIN NAHI AATE — GitHub process ko maar
@@ -44,7 +70,7 @@ on:
         required: false
         default: ''
       chunk_days:
-        description: 'Har chunk kitne din (default 15 - ye account bara hai)'
+        description: 'Har chunk kitne din (default 15)'
         required: false
         default: '15'
       dim_shrink_pct:
@@ -53,7 +79,7 @@ on:
         default: '0.5'
 
 concurrency:
-  group: admob4-sync-${{ github.ref }}
+  group: admob-sync-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -65,7 +91,21 @@ jobs:
       chunks: ${{ steps.build.outputs.chunks }}
       mode: ${{ steps.build.outputs.mode }}
     steps:
-      - name: Build chunk matrix
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # Script top-level par google libraries import karti hai (line 88), is
+      # liye --plan-chunks ko bhi ye chahiye — chahe wo credentials use na kare.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth google-auth-oauthlib google-cloud-bigquery
+
+      - name: Plan chunks
         id: build
         env:
           BF_START: ${{ github.event.inputs.backfill_start }}
@@ -73,13 +113,23 @@ jobs:
           CHUNK_DAYS: ${{ github.event.inputs.chunk_days || '15' }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/plan_chunks.py
+          # Script ko NAAM se nahi, ANDAR ke marker se dhoondho. Chaaro repos
+          # mein file ka naam alag hai (admob_python.py / admob_full_sync.py /
+          # admob_sync_v5.py) aur folder bhi alag (root ya src/).
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::AdMob sync script nahi mili (koi .py file mein 'admob_unified_fact' nahi)"
+            find . -name '*.py' -not -path './.git/*' | head -20
+            exit 1
+          fi
+          echo "Using script: $SCRIPT"
+          python "$SCRIPT" --plan-chunks
 
   daily:
     needs: plan
     if: needs.plan.outputs.mode == 'daily'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -99,16 +149,18 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
-          ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID || secrets.ADMOB_PUBLISHER_ID_ACCOUNT1 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT3 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT4 }}
+          ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT1 || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT2 || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT3 || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT4 }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID || secrets.OAUTH_CLIENT_ID_ACCOUNT1 || secrets.OAUTH_CLIENT_ID_ACCOUNT2 || secrets.OAUTH_CLIENT_ID_ACCOUNT3 || secrets.OAUTH_CLIENT_ID_ACCOUNT4 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET || secrets.OAUTH_CLIENT_SECRET_ACCOUNT1 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT3 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT4 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT1 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT3 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT4 }}
           DIM_SHRINK_PCT: ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
           DAYS_BACK: ${{ github.event.inputs.days_back || '3' }}
         run: |
           set -euo pipefail
-          python src/admob_full_sync.py --days "${DAYS_BACK}"
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
+          echo "Using script: $SCRIPT"
+          python "$SCRIPT" --days "${DAYS_BACK}"
 
       - name: Verify dimension health
         if: always()
@@ -117,8 +169,14 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
-        run: python .github/scripts/dim_health.py
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID || secrets.ADMOB_PUBLISHER_ID_ACCOUNT1 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT3 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT4 }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID || secrets.OAUTH_CLIENT_ID_ACCOUNT1 || secrets.OAUTH_CLIENT_ID_ACCOUNT2 || secrets.OAUTH_CLIENT_ID_ACCOUNT3 || secrets.OAUTH_CLIENT_ID_ACCOUNT4 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET || secrets.OAUTH_CLIENT_SECRET_ACCOUNT1 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT3 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT4 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT1 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT3 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT4 }}
+        run: |
+          set -euo pipefail
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
+          python "$SCRIPT" --dim-health
 
   backfill:
     needs: plan
@@ -149,19 +207,21 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
-          ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID || secrets.ADMOB_PUBLISHER_ID_ACCOUNT1 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT3 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT4 }}
+          ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT1 || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT2 || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT3 || secrets.ADMOB_REPORT_CURRENCY_ACCOUNT4 }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID || secrets.OAUTH_CLIENT_ID_ACCOUNT1 || secrets.OAUTH_CLIENT_ID_ACCOUNT2 || secrets.OAUTH_CLIENT_ID_ACCOUNT3 || secrets.OAUTH_CLIENT_ID_ACCOUNT4 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET || secrets.OAUTH_CLIENT_SECRET_ACCOUNT1 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT3 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT4 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT1 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT3 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT4 }}
           DIM_SHRINK_PCT: ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
           CHUNK_START: ${{ matrix.chunk.start }}
           CHUNK_END: ${{ matrix.chunk.end }}
           CHUNK_IDX: ${{ matrix.chunk.idx }}
         run: |
           set -euo pipefail
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
+          echo "Using script: $SCRIPT"
           echo "Chunk ${CHUNK_IDX}: ${CHUNK_START} -> ${CHUNK_END}"
-          python src/admob_full_sync.py \
+          python "$SCRIPT" \
             --backfill-start "${CHUNK_START}" \
             --backfill-end "${CHUNK_END}"
 
@@ -172,5 +232,11 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
-        run: python .github/scripts/dim_health.py
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID || secrets.ADMOB_PUBLISHER_ID_ACCOUNT1 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT2 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT3 || secrets.ADMOB_PUBLISHER_ID_ACCOUNT4 }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID || secrets.OAUTH_CLIENT_ID_ACCOUNT1 || secrets.OAUTH_CLIENT_ID_ACCOUNT2 || secrets.OAUTH_CLIENT_ID_ACCOUNT3 || secrets.OAUTH_CLIENT_ID_ACCOUNT4 }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET || secrets.OAUTH_CLIENT_SECRET_ACCOUNT1 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT2 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT3 || secrets.OAUTH_CLIENT_SECRET_ACCOUNT4 }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT1 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT2 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT3 || secrets.OAUTH_REFRESH_TOKEN_ACCOUNT4 }}
+        run: |
+          set -euo pipefail
+          SCRIPT=$(grep -rl 'admob_unified_fact' --include='*.py' . 2>/dev/null | head -1)
+          python "$SCRIPT" --dim-health
