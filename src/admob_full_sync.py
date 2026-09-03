@@ -59,6 +59,10 @@ USAGE:
    python admob_full_sync.py --days 3
    python admob_full_sync.py --backfill-start 2026-07-19 --backfill-end 2026-07-26
 
+   # v6.1 — sab kuch isi EK file mein. Koi alag helper script nahi.
+   python admob_full_sync.py --plan-chunks     # backfill ko chunks mein tode
+   python admob_full_sync.py --dim-health      # dimension tables khaali to nahi?
+
 DATA MODEL:
    Money fields: INT64 MICROS — divide by 1,000,000 for USD
    Partition  : report_date (DAY)
@@ -1066,14 +1070,167 @@ def backfill(start_str: str, end_str: str):
     _run("backfill", start_date, end_date, sleep_between=2)
 
 # =============================================================================
+# 🆕 v6.1 — CHUNK PLANNER   (pehle alag plan_chunks.py thi)
+# =============================================================================
+
+# Daily mode mein bhi matrix KHAALI nahi ho sakta — GitHub khaali array par
+# workflow-level error deta hai chahe job ka `if:` false ho (run #110:
+# 0 seconds, "workflow graph cannot be shown"). Is liye placeholder.
+_CHUNK_PLACEHOLDER = [{"idx": 0, "start": "1970-01-01", "end": "1970-01-01"}]
+
+
+def _emit_gh_output(mode: str, chunks: List[Dict]) -> None:
+    line_mode   = f"mode={mode}"
+    line_chunks = f"chunks={json.dumps(chunks, separators=(',', ':'))}"
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as fh:
+            fh.write(line_mode + "\n")
+            fh.write(line_chunks + "\n")
+    print(line_mode)
+    print(line_chunks)
+
+
+def plan_chunks() -> int:
+    """Backfill range ko chhote chunks mein todta hai.
+
+    KYUN: run #107 (Admob_4 / pub-9688) 60-min timeout par cancel hui.
+          Maap: 06-05 → 06-21 = 17 din, ~57 min = ~3.2 min/din.
+          90 din = ~290 min — single job mein kabhi poora nahi hoga.
+          Chunks mein har job ~50 min, aur chunk 4 fail ho to sirf
+          chunk 4 dobara chalao.
+
+    Env: BF_START · BF_END · CHUNK_DAYS (default 15)
+    Writes to GITHUB_OUTPUT:  mode=daily|backfill  ·  chunks=<json>
+    """
+    start_raw = (os.environ.get("BF_START") or "").strip()
+    end_raw   = (os.environ.get("BF_END")   or "").strip()
+
+    if not start_raw or not end_raw:
+        print("Mode: DAILY SYNC (no backfill dates given)")
+        _emit_gh_output("daily", _CHUNK_PLACEHOLDER)
+        return 0
+
+    try:
+        start = datetime.strptime(start_raw, "%Y-%m-%d").date()
+        end   = datetime.strptime(end_raw,   "%Y-%m-%d").date()
+    except ValueError as e:
+        print(f"❌ ERROR: bad date format ({e}). Use YYYY-MM-DD.")
+        return 1
+
+    if start > end:
+        print(f"❌ ERROR: backfill-start {start} is after backfill-end {end}")
+        return 1
+
+    try:
+        size = max(1, int((os.environ.get("CHUNK_DAYS") or "15").strip()))
+    except ValueError:
+        size = 15
+
+    chunks, cur, idx = [], start, 0
+    while cur <= end:
+        idx += 1
+        stop = min(cur + timedelta(days=size - 1), end)
+        chunks.append({"idx": idx, "start": cur.isoformat(), "end": stop.isoformat()})
+        cur = stop + timedelta(days=1)
+
+    total_days = (end - start).days + 1
+    print(f"Mode: BACKFILL {start} → {end} ({total_days} days) "
+          f"in {len(chunks)} chunk(s) of {size}")
+    for c in chunks:
+        span = (datetime.strptime(c["end"], "%Y-%m-%d").date()
+                - datetime.strptime(c["start"], "%Y-%m-%d").date()).days + 1
+        print(f"   chunk {c['idx']}: {c['start']} → {c['end']}  "
+              f"({span}d, ~{round(span * 3.2)} min)")
+
+    _emit_gh_output("backfill", chunks)
+    return 0
+
+# =============================================================================
+# 🆕 v6.1 — DIMENSION HEALTH CHECK   (pehle alag dim_health.py thi)
+# =============================================================================
+
+def dim_health() -> int:
+    """Har run ke BAAD chalta hai. Job ko FAIL karta hai agar is publisher
+    ki koi dimension table khaali ho — chahe sync "SUCCESS" keh chuki ho.
+
+    KYUN: run #214 mein admob_ad_units_dim se pub-5972202469838280 ki SAARI
+          5,713 rows ud gayi thin (DELETE chali, adUnits par 401 aaya, load
+          kabhi hua hi nahi). Table din bhar khaali padi rahi aur kisi ko
+          pata nahi chala.
+    """
+    publisher_id = normalize_publisher_id(ADMOB_PUBLISHER_ID)
+    if not publisher_id:
+        print("❌ ERROR: ADMOB_PUBLISHER_ID missing — cannot run health check")
+        return 1
+
+    bq = get_bq_client()
+    print(f"\n── dimension health: {PROJECT_ID}.{DATASET_ID} / {publisher_id} " + "─" * 15)
+
+    expected = {DIM_ACCOUNT: 1, DIM_APPS: 1, DIM_AD_UNITS: 1}
+    failed   = []
+
+    for table, minimum in expected.items():
+        tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+        try:
+            row = list(bq.query(
+                f"SELECT COUNT(*) AS n, "
+                f"CAST(MAX(sync_timestamp) AS STRING) AS last_sync "
+                f"FROM `{tid}` WHERE publisher_id = @p",
+                job_config=bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("p", "STRING", publisher_id)
+                ])
+            ).result())[0]
+            n, last_sync = row["n"], row["last_sync"]
+            mark = "OK   " if n >= minimum else "EMPTY"
+            print(f"   [{mark}] {table:<22} {n:>8,} rows   last_sync={last_sync}")
+            if n < minimum:
+                failed.append(table)
+        except Exception as e:
+            print(f"   [ERROR] {table:<22} {type(e).__name__}: {e}")
+            failed.append(table)
+
+    # Fact freshness — dims bhari hon magar fact purani ho to bhi masla hai
+    try:
+        row = list(bq.query(
+            f"SELECT CAST(MAX(report_date) AS STRING) AS last_dt, "
+            f"DATE_DIFF(CURRENT_DATE(), MAX(report_date), DAY) AS stale "
+            f"FROM `{PROJECT_ID}.{DATASET_ID}.{FACT_TABLE}` WHERE publisher_id = @p",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("p", "STRING", publisher_id)
+            ])
+        ).result())[0]
+        stale = row["stale"]
+        mark = "OK   " if stale is not None and stale <= 4 else "STALE"
+        print(f"   [{mark}] {FACT_TABLE:<22} last={row['last_dt']} ({stale}d old)")
+    except Exception as e:
+        print(f"   [ERROR] {FACT_TABLE:<22} {type(e).__name__}: {e}")
+
+    if failed:
+        print("\n:: DIMENSION TABLE EMPTY FOR THIS PUBLISHER ::")
+        print(f"   Affected: {', '.join(failed)}")
+        print("   Ye #214 wali shakl hai: DELETE chali, fetch mara, load nahi hua.")
+        print("   → Workflow dobara chalao. Agar phir bhi khaali rahe to AdMob API")
+        print("     is account ke liye apps/adUnits list refuse kar rahi hai.")
+        return 1
+
+    print("\n   Dimension health OK.")
+    return 0
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v6")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v6.1")
     p.add_argument("--days",           type=int, default=3)
     p.add_argument("--backfill-start", type=str)
     p.add_argument("--backfill-end",   type=str)
+    # 🆕 v6.1: ye dono modes pehle alag .py files mein the
+    p.add_argument("--plan-chunks", action="store_true",
+                   help="Backfill range ko chunks mein tode (GITHUB_OUTPUT likhta hai)")
+    p.add_argument("--dim-health",  action="store_true",
+                   help="Dimension tables khaali to nahi — exit 1 agar hain")
     # Kept for backwards compatibility with existing GitHub Actions YAML
     p.add_argument("--chunk",          type=int, default=1)
     p.add_argument("--chunk-days",     type=int, default=1)
@@ -1081,8 +1238,19 @@ def main():
     p.add_argument("--enable-campaign-beta", action="store_true")
     args = p.parse_args()
 
+    # --plan-chunks ko koi credential nahi chahiye — validate_config se pehle
+    if args.plan_chunks:
+        sys.exit(plan_chunks())
+
     if not validate_config():
         sys.exit(1)
+
+    if args.dim_health:
+        try:
+            sys.exit(dim_health())
+        except Exception as e:
+            print(f"FATAL ERROR (dim-health): {e}")
+            sys.exit(1)
 
     try:
         if args.backfill_start and args.backfill_end:
