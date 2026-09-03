@@ -1,49 +1,30 @@
-> **NOTE:** replace `.github/workflows/admob_sync.yml` in **`bigquery-terafort/Admob_4`**
-> with the YAML below. Keep the v6 `src/admob_full_sync.py` unchanged — this is a
-> workflow-only fix.
+name: AdMob Full Sync to BigQuery (Account 4 - admob4_968)
 
 # =============================================================================
-#  AdMob Full Sync to BigQuery (Account 4 - admob4_968)              (v2.0)
 #  repo: bigquery-terafort/Admob_4       publisher: pub-9688592152492531
 #  path: .github/workflows/admob_sync.yml
+#
+#  RUN #107 KYUN MARA — TIMEOUT, SCRIPT KA ERROR NAHI
+#    "cancelled in 1h 0m 16s" = GitHub ka timeout-minutes: 60
+#    MAAP: 06-05 -> 06-21 = 17 din, ~57 min = ~3.2 min/din
+#      pub-5036   13.5K rows/din   0.87 min/din    90 din =  78 min  OK
+#      pub-9688   39.0K rows/din   3.20 min/din    90 din = ~290 min FAIL
+#    Ye account ~3x bara hai. Sirf timeout barhana galat ilaaj hai —
+#    chauthe ghante mein ek flaky call aur poora run dobara zaya.
+#    DATA MEHFOOZ RAHA: v6 ka fetch-before-delete chala. 0 missing days,
+#    0 duplicate runs (BigQuery se verify kiya).
+#
+#  FIX: backfill ab 15-din ke chunks mein. Har chunk ~50 min.
+#       Chunk 4 fail ho to sirf chunk 4 dobara chalao.
+#
+#  max-parallel: 1 LAZMI HAI — har chunk shuru mein sync_dims chalata hai
+#  jo publisher-scoped DELETE+INSERT transaction hai. Parallel chunks usi
+#  publisher_id ki rows par takrayenge.
+#
+#  CANCELLED RUNS admob_sync_log MEIN NAHI AATE — GitHub process ko maar
+#  deti hai, `finally: write_log` chalta hi nahi. Monitoring "FAILED rows"
+#  nahi, "MISSING runs per publisher per day" dhoondhe.
 # =============================================================================
-#  🔴 RUN #107 KYUN MARA — TIMEOUT, SCRIPT KA ERROR NAHI
-#  ─────────────────────────────────────────────────────
-#      "cancelled in 1h 0m 16s" · "Error: The operation was canceled."
-#      Ye GitHub ka `timeout-minutes: 60` tha.
-#
-#      MAAP:  06-05 → 06-21 = 17 din, ~57 minute  =  ~3.2 min/din
-#
-#      publisher       rows/din    min/din    90 din
-#      pub-5036          13.5K       0.87      78 min  ✅
-#      pub-9688 (ye)     39.0K       3.20     ~290 min ❌
-#
-#      Ye account baqi se ~3x bara hai. 90 din ka single run ~5 ghante
-#      maangta hai — GitHub ki 6-ghante hard cap ke bilkul qareeb, bina
-#      kisi margin ke. Sirf timeout barhana GALAT ilaaj hai: chauthe
-#      ghante mein ek flaky API call aur poora run dobara zaya.
-#
-#  ✅ DATA MEHFOOZ RAHA — v5/v6 ka fetch-before-delete chala.
-#     Cancellation 06-22 ke FETCH ke dauran hui, us ki DELETE se pehle.
-#     BigQuery check: 0 missing days, 0 duplicate runs.
-#
-#  v2.0 KE FIX:
-#   1. 🔴 BACKFILL AB CHUNKS MEIN — matrix job, har chunk 15 din.
-#         Har chunk ~50 min = timeout se bohot neeche.
-#         Chunk 4 fail ho to sirf chunk 4 dobara chalao, poora 90 din nahi.
-#   2. 🔴 max-parallel: 1 — LAZMI. Har chunk shuru mein sync_dims chalata
-#         hai, jo publisher-scoped DELETE+INSERT transaction hai. Do chunk
-#         saath chalein to wo aapas mein takra jayenge.
-#   3. 🔴 timeout 60 → 90 min per chunk (daily sync ke liye 45 kaafi hai)
-#   4. 🆕 dimension health check — #214 wala khaali-dim wala haadsa pakadta hai
-#   5. 🆕 concurrency group — do runs ek saath nahi
-#
-#  ⚠️  CANCELLED RUNS LOG MEIN NAHI AATE
-#      GitHub cancellation process ko maar deti hai, `finally: write_log`
-#      chalta hi nahi. Is liye admob_sync_log mein #107 ki koi row nahi.
-#      Monitoring "FAILED rows" nahi, "MISSING runs" dhoondhe.
-# =============================================================================
-name: AdMob Full Sync to BigQuery (Account 4 - admob4_968)
 
 on:
   schedule:
@@ -55,83 +36,58 @@ on:
         required: false
         default: '3'
       backfill_start:
-        description: 'Backfill start (YYYY-MM-DD) — chunks mein tootega'
+        description: 'Backfill start (YYYY-MM-DD) - chunks mein tootega'
         required: false
+        default: ''
       backfill_end:
         description: 'Backfill end (YYYY-MM-DD)'
         required: false
+        default: ''
       chunk_days:
-        description: 'Har chunk kitne din (default 15 — ye account bara hai)'
+        description: 'Har chunk kitne din (default 15 - ye account bara hai)'
         required: false
         default: '15'
       dim_shrink_pct:
-        description: 'Dim swap se inkaar agar naye rows purane ke is ratio se kam (0 = band)'
+        description: 'Dim swap se inkaar agar naye rows purane ke is ratio se kam'
         required: false
         default: '0.5'
 
 concurrency:
-  group: admob-sync-${{ github.ref }}
+  group: admob4-sync-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════════════
-  #  PLAN — backfill range ko chunks mein todta hai
-  # ═══════════════════════════════════════════════════════════════════════
+
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      chunks:      ${{ steps.build.outputs.chunks }}
-      is_backfill: ${{ steps.build.outputs.is_backfill }}
+      chunks: ${{ steps.build.outputs.chunks }}
+      mode: ${{ steps.build.outputs.mode }}
     steps:
       - name: Build chunk matrix
         id: build
         env:
-          BF_START:   ${{ github.event.inputs.backfill_start }}
-          BF_END:     ${{ github.event.inputs.backfill_end }}
+          BF_START: ${{ github.event.inputs.backfill_start }}
+          BF_END: ${{ github.event.inputs.backfill_end }}
           CHUNK_DAYS: ${{ github.event.inputs.chunk_days || '15' }}
         run: |
           set -euo pipefail
-          if [ -z "${BF_START:-}" ] || [ -z "${BF_END:-}" ]; then
-            echo "is_backfill=false" >> "$GITHUB_OUTPUT"
-            echo "chunks=[]"         >> "$GITHUB_OUTPUT"
-            echo "Mode: DAILY SYNC (no chunking needed)"
-            exit 0
-          fi
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import os, json
-          from datetime import date, timedelta
-          s = date.fromisoformat(os.environ["BF_START"])
-          e = date.fromisoformat(os.environ["BF_END"])
-          n = max(1, int(os.environ["CHUNK_DAYS"]))
-          if s > e:
-              raise SystemExit(f"backfill_start {s} is after backfill_end {e}")
-          chunks, cur, i = [], s, 0
-          while cur <= e:
-              i += 1
-              stop = min(cur + timedelta(days=n - 1), e)
-              chunks.append({"idx": i, "start": cur.isoformat(), "end": stop.isoformat()})
-              cur = stop + timedelta(days=1)
-          print(f"is_backfill=true")
-          print(f"chunks={json.dumps(chunks)}")
-          import sys
-          print(f"Planned {len(chunks)} chunk(s) of {n} day(s)", file=sys.stderr)
-          PY
+          python3 .github/scripts/plan_chunks.py
 
-  # ═══════════════════════════════════════════════════════════════════════
-  #  DAILY SYNC — normal schedule ka rasta
-  # ═══════════════════════════════════════════════════════════════════════
   daily:
     needs: plan
-    if: needs.plan.outputs.is_backfill == 'false'
+    if: needs.plan.outputs.mode == 'daily'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -139,17 +95,17 @@ jobs:
 
       - name: Run AdMob daily sync
         env:
-          GCP_PROJECT_ID:        ${{ secrets.GCP_PROJECT_ID }}
-          GCP_CREDENTIALS_JSON:  ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET_ID:         ${{ secrets.BQ_DATASET_ID }}
-          BQ_LOCATION:           ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID:    ${{ secrets.ADMOB_PUBLISHER_ID }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
           ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          OAUTH_CLIENT_ID:       ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET:   ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN:   ${{ secrets.OAUTH_REFRESH_TOKEN }}
-          DIM_SHRINK_PCT:        ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
-          DAYS_BACK:             ${{ github.event.inputs.days_back || '3' }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          DIM_SHRINK_PCT: ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
+          DAYS_BACK: ${{ github.event.inputs.days_back || '3' }}
         run: |
           set -euo pipefail
           python src/admob_full_sync.py --days "${DAYS_BACK}"
@@ -157,67 +113,64 @@ jobs:
       - name: Verify dimension health
         if: always()
         env:
-          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET_ID:        ${{ secrets.BQ_DATASET_ID }}
-          BQ_LOCATION:          ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID:   ${{ secrets.ADMOB_PUBLISHER_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
         run: python .github/scripts/dim_health.py
 
-  # ═══════════════════════════════════════════════════════════════════════
-  #  BACKFILL — chunks, ek waqt mein ek
-  #  ⚠️  max-parallel: 1 LAZMI HAI. Har chunk sync_dims chalata hai jo
-  #      publisher-scoped DELETE+INSERT transaction hai — parallel chunks
-  #      usi publisher_id ki rows par takra jayenge.
-  # ═══════════════════════════════════════════════════════════════════════
   backfill:
     needs: plan
-    if: needs.plan.outputs.is_backfill == 'true'
+    if: needs.plan.outputs.mode == 'backfill'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       max-parallel: 1
-      fail-fast: false          # ek chunk fail ho to baqi phir bhi chalein
+      fail-fast: false
       matrix:
         chunk: ${{ fromJson(needs.plan.outputs.chunks) }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install google-api-python-client google-auth google-auth-oauthlib google-cloud-bigquery
 
-      - name: "Backfill chunk ${{ matrix.chunk.idx }}: ${{ matrix.chunk.start }} → ${{ matrix.chunk.end }}"
+      - name: Run backfill chunk
         env:
-          GCP_PROJECT_ID:        ${{ secrets.GCP_PROJECT_ID }}
-          GCP_CREDENTIALS_JSON:  ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET_ID:         ${{ secrets.BQ_DATASET_ID }}
-          BQ_LOCATION:           ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID:    ${{ secrets.ADMOB_PUBLISHER_ID }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
           ADMOB_REPORT_CURRENCY: ${{ secrets.ADMOB_REPORT_CURRENCY }}
-          OAUTH_CLIENT_ID:       ${{ secrets.OAUTH_CLIENT_ID }}
-          OAUTH_CLIENT_SECRET:   ${{ secrets.OAUTH_CLIENT_SECRET }}
-          OAUTH_REFRESH_TOKEN:   ${{ secrets.OAUTH_REFRESH_TOKEN }}
-          DIM_SHRINK_PCT:        ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
-          CHUNK_START:           ${{ matrix.chunk.start }}
-          CHUNK_END:             ${{ matrix.chunk.end }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          DIM_SHRINK_PCT: ${{ github.event.inputs.dim_shrink_pct || '0.5' }}
+          CHUNK_START: ${{ matrix.chunk.start }}
+          CHUNK_END: ${{ matrix.chunk.end }}
+          CHUNK_IDX: ${{ matrix.chunk.idx }}
         run: |
           set -euo pipefail
-          echo "Chunk ${{ matrix.chunk.idx }}: ${CHUNK_START} -> ${CHUNK_END}"
+          echo "Chunk ${CHUNK_IDX}: ${CHUNK_START} -> ${CHUNK_END}"
           python src/admob_full_sync.py \
             --backfill-start "${CHUNK_START}" \
-            --backfill-end   "${CHUNK_END}"
+            --backfill-end "${CHUNK_END}"
 
       - name: Verify dimension health
         if: always()
         env:
-          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET_ID:        ${{ secrets.BQ_DATASET_ID }}
-          BQ_LOCATION:          ${{ secrets.BQ_LOCATION }}
-          ADMOB_PUBLISHER_ID:   ${{ secrets.ADMOB_PUBLISHER_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
         run: python .github/scripts/dim_health.py
